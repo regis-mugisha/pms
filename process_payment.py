@@ -1,104 +1,146 @@
-import csv
 import serial
 import time
+import serial.tools.list_ports
+import platform
+import sqlite3
 from datetime import datetime
+import math
 
-CSV_FILE = 'plates_log.csv'
-SERIAL_PORT = 'COM3'  # Update this if needed
-BAUD_RATE = 9600
+DB_FILE = 'car_logs.db'
+RATE_PER_HOUR = 500  # New rate: 500 RWF per hour
 
-def find_oldest_unpaid_entry(plate):
-    with open(CSV_FILE, 'r') as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        unpaid_entries = [row for row in reader if row[0] == plate and row[1] == '0']
-        return unpaid_entries[0] if unpaid_entries else None
+# Detect Arduino port automatically based on OS and port descriptions
+def detect_arduino_port():
+    ports = list(serial.tools.list_ports.comports())
+    system = platform.system()
+    for port in ports:
+        desc = port.description.lower()
+        device = port.device.lower()
+        if system == "Linux":
+            if "ttyusb" in device or "ttyacm" in device or "arduino" in desc:
+                return port.device
+        elif system == "Darwin":
+            if "usbmodem" in device or "usbserial" in device or "arduino" in desc:
+                return port.device
+        elif system == "Windows":
+            if "arduino" in desc or "usb-serial" in desc or "com" in device:
+                return port.device
+    return None
 
-def mark_payment_done(plate, timestamp):
-    rows = []
-    with open(CSV_FILE, 'r') as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        for row in reader:
-            if row[0] == plate and row[1] == '0' and row[2] == timestamp:
-                row[1] = '1'
-            rows.append(row)
-    with open(CSV_FILE, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
-
-def calculate_parking_fee(entry_time_str):
-    entry_time = datetime.strptime(entry_time_str, "%Y-%m-%d %H:%M:%S")
-    duration = datetime.now() - entry_time
-    hours = max(1, int(duration.total_seconds() / 3600))  # At least 1 hour
-    rate_per_hour = 1000  # Customize as needed
-    return hours * rate_per_hour
-
-def read_card_data(ser):
-    ser.reset_input_buffer()  # Clear input buffer
-    ser.write(b"READ#")
-    time.sleep(1)
-    response = ser.read_all().decode().strip()
-    if "[NO_CARD]" in response:
-        print("[ERROR] No card detected. Please try again.")
-        return None, None
+def parse_arduino_data(line):
     try:
-        plate, balance = response.split(",")
-        return plate.strip(), int(balance.strip())
-    except ValueError:
-        print("[ERROR] Failed to parse card data:", response)
+        parts = line.strip().split(',')
+        print(f"[ARDUINO] Parsed parts: {parts}")
+        if len(parts) != 2:
+            return None, None
+        plate = parts[0].strip()
+        balance_str = ''.join(c for c in parts[1] if c.isdigit())
+        print(f"[ARDUINO] Cleaned balance: {balance_str}")
+        if balance_str:
+            balance = int(balance_str)
+            return plate, balance
+        else:
+            return None, None
+    except ValueError as e:
+        print(f"[ERROR] Value error in parsing: {e}")
         return None, None
 
-def update_card_balance(ser, new_amount, retries=3, timeout=3):
-    for attempt in range(retries):
-        ser.reset_input_buffer()  # Clear input buffer
-        ser.write(f'UPDATE#{new_amount}#'.encode())
-        time.sleep(timeout)  # Increased to 3 seconds
-        ack = ser.read_all().decode().strip()
-        if "[UPDATED]" in ack:
-            print("[INFO] Card updated successfully")
-            return True
+def process_payment(plate, balance, ser, cursor, conn):
+    try:
+        cursor.execute(
+            "SELECT id, payment_status, entry_time FROM car_entries WHERE plate = ? AND payment_status = 0 ORDER BY entry_time ASC",
+            (plate,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            print("[PAYMENT] Plate not found or already paid.")
+            return
+
+        record_id, payment_status, entry_time_str = row
+        entry_time = datetime.strptime(entry_time_str, '%Y-%m-%d %H:%M:%S')
+        exit_time = datetime.now()
+        time_spent_seconds = (exit_time - entry_time).total_seconds()
+        hours_spent = math.ceil(time_spent_seconds / 3600)
+        amount_due = hours_spent * RATE_PER_HOUR
+
+        if balance < amount_due:
+            print("[PAYMENT] Insufficient balance")
+            ser.write(b'I\n')  # Notify Arduino
+            return
         else:
-            print(f"[ERROR] Failed to update card (attempt {attempt+1}): {ack}")
-            if attempt < retries - 1:
-                print("[INFO] Retrying...")
-                time.sleep(1)
-    print("[ERROR] All attempts to update card failed")
-    return False
+            new_balance = balance - amount_due
+
+            print("[WAIT] Waiting for Arduino READY...")
+            start_time = time.time()
+            while True:
+                if ser.in_waiting:
+                    arduino_response = ser.readline().decode().strip()
+                    print(f"[ARDUINO] {arduino_response}")
+                    if arduino_response == "READY":
+                        break
+                if time.time() - start_time > 5:
+                    print("[ERROR] Timeout waiting for Arduino READY")
+                    return
+
+            ser.write(f"{new_balance}\r\n".encode())
+            print(f"[PAYMENT] Sent new balance {new_balance}")
+
+            start_time = time.time()
+            print("[WAIT] Waiting for Arduino confirmation...")
+            while True:
+                if ser.in_waiting:
+                    confirm = ser.readline().decode().strip()
+                    print(f"[ARDUINO] {confirm}")
+                    if "DONE" in confirm:
+                        print("[ARDUINO] Payment confirmed")
+                        cursor.execute('''
+                            UPDATE car_entries
+                            SET payment_status = 1,
+                                exit_time = ?
+                            WHERE id = ?
+                        ''', (exit_time.strftime('%Y-%m-%d %H:%M:%S'), record_id))
+                        conn.commit()
+                        break
+                if time.time() - start_time > 10:
+                    print("[ERROR] Timeout waiting for confirmation")
+                    break
+                time.sleep(0.1)
+
+    except Exception as e:
+        print(f"[ERROR] Payment processing failed: {e}")
 
 def main():
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=5)
-    time.sleep(2)
-    print("[INFO] Waiting for card...")
-    plate, balance = read_card_data(ser)
-    if not plate or balance is None:
-        ser.close()
+    port = detect_arduino_port()
+    if not port:
+        print("[ERROR] Arduino not found")
         return
-    print(f"[CARD] Plate: {plate}, Balance: {balance}")
-    unpaid = find_oldest_unpaid_entry(plate)
-    if not unpaid:
-        print(f"[INFO] No unpaid parking records for {plate}")
-        ser.close()
-        return
-    print(f"[INFO] Unpaid entry found from {unpaid[2]}")
-    fee = calculate_parking_fee(unpaid[2])
-    print(f"[INFO] Parking fee: {fee}")
-    if balance < fee:
-        print("[ERROR] Insufficient balance on card.")
-        ser.close()
-        return
-    print("[INFO] Please keep the card in place until payment is complete...")
-    new_balance = balance - fee
-    success = update_card_balance(ser, new_balance, retries=3, timeout=3)
-    if not success:
-        print("[ABORT] Payment not completed due to card update failure.")
-        ser.close()
-        return
-    mark_payment_done(plate, unpaid[2])
-    print(f"[SUCCESS] Payment completed for {plate}")
-    print(f"[INFO] New card balance: {new_balance}")
-    ser.close()
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    try:
+        ser = serial.Serial(port, 9600, timeout=1)
+        print(f"[CONNECTED] Listening on {port}")
+        time.sleep(2)
+        ser.reset_input_buffer()
+
+        while True:
+            if ser.in_waiting:
+                line = ser.readline().decode().strip()
+                if line:
+                    print(f"[SERIAL] Received: {line}")
+                    plate, balance = parse_arduino_data(line)
+                    if plate and balance is not None:
+                        process_payment(plate, balance, ser, cursor, conn)
+
+    except KeyboardInterrupt:
+        print("[EXIT] Program terminated by user.")
+    except Exception as e:
+        print(f"[ERROR] {e}")
+    finally:
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
+        conn.close()
 
 if __name__ == "__main__":
     main()
